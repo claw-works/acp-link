@@ -1,0 +1,338 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+/// 飞书应用配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuConfig {
+    pub app_id: String,
+    pub app_secret: String,
+}
+
+/// Kiro CLI 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroConfig {
+    /// 可执行文件路径，例如 "kiro-cli"
+    pub cmd: String,
+    /// 启动参数，例如 ["acp"]
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// kiro-cli 进程池大小，通过 thread_id hash 路由实现并行处理，默认为 4
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
+}
+
+fn default_pool_size() -> usize {
+    4
+}
+
+/// 存储配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// 文件和视频的保存目录
+    pub save_dir: PathBuf,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            save_dir: default_home_dir().join("data"),
+        }
+    }
+}
+
+/// 应用全局配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    /// 日志级别，例如 "info", "debug", "warn"
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    pub feishu: FeishuConfig,
+    pub kiro: KiroConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+/// 返回 `~/.acp-link/` 目录路径
+fn default_home_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".acp-link")
+}
+
+impl AppConfig {
+    /// 创建默认配置文件模板
+    fn create_default(path: &Path) -> Result<()> {
+        const DEFAULT_CONFIG: &str = r#"log_level = "info"
+
+[feishu]
+app_id = "YOUR_APP_ID"
+app_secret = "YOUR_APP_SECRET"
+
+[kiro]
+cmd = "kiro-cli"
+args = ["acp", "--agent", "lark"]
+"#;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+        }
+        std::fs::write(path, DEFAULT_CONFIG)
+            .with_context(|| format!("写入默认配置文件失败: {}", path.display()))?;
+        Ok(())
+    }
+
+    /// 从指定路径加载配置文件（TOML 格式）
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acp_link::config::AppConfig;
+    /// let config = AppConfig::load("config.toml").unwrap();
+    /// ```
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
+        let config: Self = toml::from_str(&content)
+            .with_context(|| format!("解析配置文件失败: {}", path.display()))?;
+        config.ensure_dirs()?;
+        Ok(config)
+    }
+
+    /// 确保配置中涉及的目录存在，不存在则自动创建
+    fn ensure_dirs(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.storage.save_dir)
+            .with_context(|| format!("创建存储目录失败: {}", self.storage.save_dir.display()))?;
+        Ok(())
+    }
+
+    /// 按优先级查找并加载配置文件：
+    /// 1. 环境变量 `ACP_LINK_CONFIG` 指定的路径
+    /// 2. 当前目录下的 `config.toml`
+    /// 3. `~/.acp-link/config.toml`
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use acp_link::config::AppConfig;
+    /// let config = AppConfig::discover().unwrap();
+    /// ```
+    pub fn discover() -> Result<Self> {
+        if let Ok(env_path) = std::env::var("ACP_LINK_CONFIG") {
+            return Self::load(&env_path);
+        }
+
+        let local_path = PathBuf::from("config.toml");
+        if local_path.exists() {
+            return Self::load(&local_path);
+        }
+
+        let global_path = default_home_dir().join("config.toml");
+        if global_path.exists() {
+            return Self::load(&global_path);
+        }
+
+        // 未找到配置文件，创建默认配置并提醒用户修改
+        Self::create_default(&global_path)?;
+        anyhow::bail!(
+            "已创建默认配置文件: {}\n请修改其中的飞书 app_id/app_secret 等参数后重新启动",
+            global_path.display()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造最小合法配置 TOML 内容
+    fn minimal_config_toml(save_dir: &Path) -> String {
+        format!(
+            r#"
+[feishu]
+app_id = "cli_test"
+app_secret = "secret123"
+
+[kiro]
+cmd = "kiro"
+args = ["acp"]
+
+[storage]
+save_dir = "{}"
+"#,
+            save_dir.display()
+        )
+    }
+
+    fn make_temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "acp_link_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+        dir
+    }
+
+    #[test]
+    fn test_load_valid_config() {
+        // 正常路径：合法 TOML 文件可被加载
+        let tmp = make_temp_dir();
+        let save_dir = tmp.join("data");
+        let content = minimal_config_toml(&save_dir);
+        let config_path = tmp.join("config.toml");
+        std::fs::write(&config_path, &content).unwrap();
+
+        let config = AppConfig::load(&config_path).expect("加载配置应成功");
+        assert_eq!(config.feishu.app_id, "cli_test");
+        assert_eq!(config.feishu.app_secret, "secret123");
+        assert_eq!(config.kiro.cmd, "kiro");
+        assert_eq!(config.kiro.args, vec!["acp"]);
+        // save_dir 应已被创建
+        assert!(save_dir.exists());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_load_default_log_level() {
+        // log_level 未指定时应为 "info"
+        let tmp = make_temp_dir();
+        let save_dir = tmp.join("data");
+        let content = minimal_config_toml(&save_dir);
+        let config_path = tmp.join("config.toml");
+        std::fs::write(&config_path, &content).unwrap();
+
+        let config = AppConfig::load(&config_path).unwrap();
+        assert_eq!(config.log_level, "info");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_load_custom_log_level() {
+        // log_level 可被覆盖
+        let tmp = make_temp_dir();
+        let save_dir = tmp.join("data");
+        let mut content = minimal_config_toml(&save_dir);
+        content = format!("log_level = \"debug\"\n{content}");
+        let config_path = tmp.join("config.toml");
+        std::fs::write(&config_path, &content).unwrap();
+
+        let config = AppConfig::load(&config_path).unwrap();
+        assert_eq!(config.log_level, "debug");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_load_default_pool_size() {
+        // pool_size 未指定时默认为 4
+        let tmp = make_temp_dir();
+        let save_dir = tmp.join("data");
+        let content = minimal_config_toml(&save_dir);
+        let config_path = tmp.join("config.toml");
+        std::fs::write(&config_path, &content).unwrap();
+
+        let config = AppConfig::load(&config_path).unwrap();
+        assert_eq!(config.kiro.pool_size, 4);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_load_custom_pool_size() {
+        // pool_size 可被覆盖
+        let tmp = make_temp_dir();
+        let save_dir = tmp.join("data");
+        let content = format!(
+            r#"
+[feishu]
+app_id = "x"
+app_secret = "y"
+
+[kiro]
+cmd = "kiro"
+pool_size = 8
+
+[storage]
+save_dir = "{}"
+"#,
+            save_dir.display()
+        );
+        let config_path = tmp.join("config.toml");
+        std::fs::write(&config_path, &content).unwrap();
+
+        let config = AppConfig::load(&config_path).unwrap();
+        assert_eq!(config.kiro.pool_size, 8);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_load_nonexistent_file_returns_error() {
+        // 文件不存在时应返回错误
+        let result = AppConfig::load("/nonexistent/path/config.toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_invalid_toml_returns_error() {
+        // 非法 TOML 内容应返回解析错误
+        let tmp = make_temp_dir();
+        let config_path = tmp.join("config.toml");
+        std::fs::write(&config_path, "not valid toml :::").unwrap();
+
+        let result = AppConfig::load(&config_path);
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_discover_via_env_var() {
+        // 通过环境变量指定配置路径
+        let tmp = make_temp_dir();
+        let save_dir = tmp.join("data");
+        let content = minimal_config_toml(&save_dir);
+        let config_path = tmp.join("config.toml");
+        std::fs::write(&config_path, &content).unwrap();
+
+        // 设置环境变量后 discover 应读取该路径
+        // SAFETY: 单线程测试环境，set_var/remove_var 不存在数据竞争
+        unsafe {
+            std::env::set_var("ACP_LINK_CONFIG", config_path.to_str().unwrap());
+        }
+        let result = AppConfig::discover();
+        unsafe {
+            std::env::remove_var("ACP_LINK_CONFIG");
+        }
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().feishu.app_id, "cli_test");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_storage_default_contains_data_subdir() {
+        // StorageConfig::default() 的 save_dir 应以 "data" 结尾
+        let storage = StorageConfig::default();
+        assert!(storage
+            .save_dir
+            .to_string_lossy()
+            .contains(".acp-link"));
+        assert_eq!(
+            storage.save_dir.file_name().and_then(|s| s.to_str()),
+            Some("data")
+        );
+    }
+}
