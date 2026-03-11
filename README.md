@@ -17,7 +17,6 @@
 
 ## 前置要求
 
-- [Rust](https://rustup.rs/) 1.85+（edition 2024）
 - [kiro-cli](https://kiro.dev/)（需支持 `kiro-cli acp` 模式）
 - 飞书自建应用，需开通以下权限：
   - `im:message:receive_v1`（接收消息事件）
@@ -25,15 +24,9 @@
   - `im:message.p2p_msg`（私聊消息）
   - `im:resource`（下载图片/文件资源）
 
-## 安装与构建
+## 安装
 
-```bash
-git clone https://github.com/your-org/acp-link
-cd acp-link
-cargo build --release
-```
-
-编译产物位于 `target/release/acp-link`。
+从 [Releases](https://github.com/xufanglin/acp-link/releases) 页面下载对应平台的二进制文件，解压后放到 PATH 可访问的目录（如 `/usr/local/bin/`）即可。
 
 ## 配置说明
 
@@ -52,9 +45,6 @@ app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 cmd = "kiro-cli"
 args = ["acp", "--agent", "lark"]
 pool_size = 4          # 进程池大小，按 thread_id hash 路由
-
-[storage]
-save_dir = "/home/user/.acp-link/data"   # 资源文件存储目录（可选，默认为 ~/.acp-link/data）
 ```
 
 ### 配置查找顺序
@@ -78,6 +68,62 @@ RUST_LOG=debug ./acp-link
 ```
 
 启动后服务会通过飞书 WS 长连接监听消息，无需额外配置 Webhook 回调地址。
+
+## 作为 systemd 用户服务运行
+
+将下载的二进制移动到系统路径：
+
+```bash
+sudo install -m 755 acp-link /usr/local/bin/
+```
+
+创建 systemd 用户服务文件：
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/acp-link.service << 'EOF'
+[Unit]
+Description=ACP Link - Feishu to Kiro bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/acp-link
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+EOF
+```
+
+> `%h` 是 systemd specifier，会自动展开为当前用户的 home 目录（相当于 `$HOME`）。
+> 这里将 `~/.local/bin` 加入 PATH 是为了让 `kiro-cli` 等安装在用户目录下的工具能被找到。
+
+启用并启动服务：
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now acp-link.service
+```
+
+查看运行状态和日志：
+
+```bash
+# 查看服务状态
+systemctl --user status acp-link.service
+
+# 实时查看日志
+journalctl --user -u acp-link.service -f
+```
+
+停止 / 重启：
+
+```bash
+systemctl --user stop acp-link.service
+systemctl --user restart acp-link.service
+```
 
 ## 项目结构
 

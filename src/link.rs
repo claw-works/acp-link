@@ -40,13 +40,9 @@ impl LinkService {
     /// 从配置初始化所有组件
     pub async fn new(config: &AppConfig) -> Result<Self> {
         let client = FeishuClient::new(&config.feishu.app_id, &config.feishu.app_secret);
-        let resource_store = ResourceStore::new(&config.storage.save_dir);
-        let sessions_path = config
-            .storage
-            .save_dir
-            .parent()
-            .unwrap_or(&config.storage.save_dir)
-            .join("sessions.json");
+        let data_dir = AppConfig::data_dir();
+        let resource_store = ResourceStore::new(&data_dir);
+        let sessions_path = data_dir.parent().unwrap_or(&data_dir).join("sessions.json");
         let session_map = SessionMap::load(&sessions_path)?;
         let bridge = AcpBridge::start(&config.kiro).await?;
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
